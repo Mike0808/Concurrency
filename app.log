@@ -1,0 +1,1 @@
+[2021.12.05 11:41:59] I Memc loader started with options: {'test': False, 'log': 'app.log', 'dry': False, 'pattern': '/data/appsinstalled/*.tsv.gz', 'idfa': '127.0.0.1:33013', 'gaid': '127.0.0.1:33014', 'adid': '127.0.0.1:33015', 'dvid': '127.0.0.1:33016'}
