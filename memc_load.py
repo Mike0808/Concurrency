@@ -84,7 +84,8 @@ def insert_appsinstalled(mc_client_pool, memc_addr, appsinstalled, dry_run=False
 
 
 def parse_appsinstalled(line):
-    line = line.decode("utf-8")
+    if isinstance(line, bytes):
+        line = line.decode("utf-8")
     line_parts = line.strip().split("\t")
     if len(line_parts) < 5:
         return
