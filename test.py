@@ -1,13 +1,10 @@
 import collections
 import functools
 import glob
-import gzip
 import os
-import threading
 import unittest
-from queue import Queue
 from threading import Lock as TLock
-from multiprocessing import Queue as MpQueue, Lock as MpLock, JoinableQueue as MpJQueue, cpu_count, Value
+from multiprocessing import Lock as MpLock, JoinableQueue as MpJQueue, cpu_count, Value
 
 import memc_load
 
@@ -63,32 +60,21 @@ class MyTestCase(unittest.TestCase):
     def test_thread_open_file(self, files):
         tlock = TLock()
         mlock = MpLock()
-        mqueue = MpJQueue()
         jq = MpJQueue()
         n_processors = cpu_count()
         errors = Value('i')
         processed = Value('i')
         lines = Value('i')
 
-        worker_process_files = memc_load.build_processor_worker_pool_files(files, errors, jq,
+        worker_process_files = memc_load.build_processor_worker_pool_files(files, errors, opts, jq,
                                                                            mlock, n_processors, lines)
-        jq.join()
-        worker_processor_consumer = memc_load.build_consumer_worker_pool_files(opts, jq, mqueue, mlock, errors,
-                                                                               n_processors)
-        mqueue.join()
-        worker_memcache_filler = memc_load.build_thread_worker_pool_consumer(mqueue, tlock, errors, processed)
+        worker_memcache_filler = memc_load.build_thread_worker_pool_consumer(jq, tlock, errors, processed)
 
         for process in worker_process_files:
             process.join()
 
-        for _ in worker_process_files:
-            jq.put(None)
-
-        for process in worker_processor_consumer:
-            process.join()
-
         for _ in worker_memcache_filler:
-            mqueue.put(None)
+            jq.put((None, None))
 
         for thread in worker_memcache_filler:
             thread.join()

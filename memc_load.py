@@ -24,6 +24,7 @@ TIMEOUT = 1
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 PROCESSES_NUM = 2
 THREAD_NUM = 3
+BUCKET_SIZE = 5
 
 # https://stackoverflow.com/questions/19665235/memcache-client-with-connection-pool-for-python
 memcache.Client = type('Client', (object,), dict(memcache.Client.__dict__))
@@ -92,131 +93,114 @@ def parse_appsinstalled(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
-class Processor_files(Process):
+class ProcessorFiles(Process):
 
-    def __init__(self, files, errors, jqueue=None, lock=None, lines=None):
-        Process.__init__(self)
+    def __init__(self, files, errors, options, jqueue=None, lock=None, lines=None):
+        super(Processor_files, self).__init__()
         self.files = files
         self.queue = jqueue
         self.lock = lock
         self.errors = errors
         self.lines = lines
-
-    def run(self):
-        try:
-            for file in self.files:
-                logging.info(f'Processing {file}')
-                with self.lock, gzip.open(file) as fd:
-                    for line in fd:
-                        if not line:
-                            continue
-                        parsed_line = parse_appsinstalled(line)
-                        if not parsed_line:
-                            self.errors.value += 1
-                            continue
-                        self.queue.put(parsed_line)
-                        if self.lines:
-                            self.lines.value += 1
-                    dot_rename(file)
-
-        except Exception as E:
-            logging.error(f"Something went wrong: {E}")
-
-
-class Consumer_appsinstalled(Process):
-
-    def __init__(self, options, task_queue, result_queue, lock, errors):
-        super(Consumer_appsinstalled, self).__init__()
-        self.task_queue = task_queue
-        self.result_queue = result_queue
         self.options = options
-        self.lock = lock
-        self.errors = errors
+        self.bucket = BUCKET_SIZE
         self.device_memc = {
             "idfa": self.options.idfa,
             "gaid": self.options.gaid,
             "adid": self.options.adid,
             "dvid": self.options.dvid,
         }
+        self.dict_of_lists = {self.options.idfa: {},
+                              self.options.gaid: {},
+                              self.options.adid: {},
+                              self.options.dvid: {}}
 
     def run(self):
         pname = self.name
-        while True:
-            try:
-                logging.info(f'Processing appsinstalled data')
-                item_appinstalled = self.task_queue.get()
-                if item_appinstalled is None:
-                    logging.error(f'Exiting {pname}. Queue Empty')
-                    self.task_queue.task_done()
-                    break
-                memc_addr = self.device_memc.get(item_appinstalled.dev_type)
-                if not memc_addr:
-                    with self.lock:
-                        self.errors.value += 1
-                        logging.error("Unknow device type: %s" % item_appinstalled.dev_type)
-                        continue
-                item_for_memcache = insert_appsinstalled(item_appinstalled, memc_addr, self.options.dry)
-                self.task_queue.task_done()
-                self.result_queue.put((item_for_memcache, memc_addr))
-            except Exception as E:
-                logging.error(f"Something went wrong: {E}")
+        try:
+            for file in self.files:
+                logging.info(f'Processing {file}')
+                try:
+                    with self.lock, gzip.open(file) as fd:
+                        for line in fd:
+                            if not line:
+                                continue
+                            item_appinstalled = parse_appsinstalled(line)
+                            if not item_appinstalled:
+                                self.errors.value += 1
+                                continue
+                            memc_addr = self.device_memc.get(item_appinstalled.dev_type)
+                            if not memc_addr:
+                                self.errors.value += 1
+                                logging.error("Unknow device type: %s" % item_appinstalled.dev_type)
+                                continue
+                            key, value = insert_appsinstalled(item_appinstalled, memc_addr, self.options.dry)
+                            self.dict_of_lists[memc_addr].update({key: value})
+                            if len(self.dict_of_lists[memc_addr]) >= self.bucket:
+                                self.queue.put([memc_addr, self.dict_of_lists.get(memc_addr)])
+                                self.dict_of_lists[memc_addr].clear()
+                                if self.lines:
+                                    self.lines.value += 1
+                        dot_rename(file)
+                except Exception:
+                    continue
+                for k, v in self.dict_of_lists.items():
+                    if len(self.dict_of_lists[k]) > 0:
+                        self.queue.put([k, self.dict_of_lists.get(k)])
+                        if self.lines:
+                            self.lines.value += 1
+                self.dict_of_lists.clear()
+        except Exception as e:
+            logging.error(f"Something went wrong {pname}: {e}")
 
 
-class Memcache_Filler(Thread):
+class MemcacheFiller(Thread):
 
     def __init__(self, queue, lock, errors, processed):
         Thread.__init__(self)
-        self.memc_addr = None
         self.queue = queue
         self.lock = lock
         self.errors = errors
+        self.bucket = BUCKET_SIZE
         self.processed = processed
 
     def run(self):
         tname = self.name
         while self.queue._notempty:
-            item_for_memcache, memc_addr = self.queue.get()
-            self.memc_addr = memc_addr
-            if item_for_memcache is None or memc_addr is None:
-                logging.error(f'Exiting {tname}. Queue Empty')
-                self.queue.task_done()
-                break
             try:
-                with self.lock:
-                    mc_client_pool = PoolClient(1, TIMEOUT, [memc_addr])
-                    ok = self.do_work(item_for_memcache, mc_client_pool)
-                    if not ok:
-                        self.errors.value += 1
-                    else:
-                        self.processed.value += 1
+                memc_addr, bucket = self.queue.get()
+                if bucket is None or memc_addr is None:
+                    logging.error(f'Exiting {tname}. Queue Empty')
+                    self.queue.task_done()
+                    break
+                try:
+                    with self.lock:
+                        mc_client_pool = PoolClient(1, TIMEOUT, [memc_addr])
+                        ok = self.do_work(bucket, mc_client_pool)
+                        if not ok:
+                            self.errors.value += 1
+                        else:
+                            self.processed.value += 1
+                except Exception as e:
+                    logging.error(f"Something went wrong: {e}")
             except Exception as e:
-                logging.error(f"Something went wrong: {e}")
+                break
 
     def do_work(self, item_for_memcache, mc_client_pool):
         try:
-            key, packed = item_for_memcache
             self.queue.task_done()
             with mc_client_pool.reserve() as mc_client:
-                mc_client.set(key, packed)
+                mc_client.set_multi(item_for_memcache)
         except Exception as e:
             logging.exception("Cannot write to memc %s: %s" % (self.memc_addr, e))
             return False
         return True
 
 
-def build_processor_worker_pool_files(files, errors, jqueue, mlock, n_processors, lines=None):
+def build_processor_worker_pool_files(files, errors, options, jqueue, mlock, n_processors, lines=None):
     workers = []
     for n in range(n_processors):
-        worker = Processor_files(files, errors, jqueue, mlock, lines)
-        worker.start()
-        workers.append(worker)
-    return workers
-
-
-def build_consumer_worker_pool_files(options, task_queue, result_queue, lock, errors, size=PROCESSES_NUM):
-    workers = []
-    for _ in range(size):
-        worker = Consumer_appsinstalled(options, task_queue, result_queue, lock, errors)
+        worker = Processorfiles(files, errors, options, jqueue, mlock, lines)
         worker.start()
         workers.append(worker)
     return workers
@@ -225,7 +209,7 @@ def build_consumer_worker_pool_files(options, task_queue, result_queue, lock, er
 def build_thread_worker_pool_consumer(queue, lock, errors, processed, size=THREAD_NUM):
     workers = []
     for _ in range(size):
-        worker = Memcache_Filler(queue, lock, errors, processed)
+        worker = MemcacheFiller(queue, lock, errors, processed)
         worker.start()
         workers.append(worker)
     return workers
@@ -242,10 +226,7 @@ def main(files, options):
 
     worker_process_files = build_processor_worker_pool_files(files, errors, jq,
                                                              mlock, n_processors)
-    jq.join()
-    worker_processor_consumer = build_consumer_worker_pool_files(opts, jq, mqueue, mlock, errors,
-                                                                 n_processors)
-    mqueue.join()
+
     worker_memcache_filler = build_thread_worker_pool_consumer(mqueue, tlock, errors, processed)
 
     for process in worker_process_files:
@@ -253,12 +234,6 @@ def main(files, options):
 
     for _ in worker_process_files:
         jq.put(None)
-
-    for process in worker_processor_consumer:
-        process.join()
-
-    for _ in worker_memcache_filler:
-        mqueue.put(None)
 
     for thread in worker_memcache_filler:
         thread.join()
